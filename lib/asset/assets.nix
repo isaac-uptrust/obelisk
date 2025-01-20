@@ -30,8 +30,28 @@ delay = identifier:
 #
 # defaultEncodings :: String -> Derivation
 defaultEncodings =
+  identityEncodings;
+
+  # Disabling compression to speed up debug builds
+  #
   # zopfli isn't supported on macOS as of nixpkgs eafd703a63
-  if nixpkgs.stdenv.isDarwin then gzipEncodings else zopfliEncodings;
+  # if nixpkgs.stdenv.isDarwin then gzipEncodings else zopfliEncodings;
+
+# identityEncodings :: String -> Derivation
+identityEncodings = file:
+  nixpkgs.stdenv.mkDerivation {
+    name = "encodings";
+
+    input = mkPath file;
+
+    builder = builtins.toFile "builder.sh" ''
+      source "$stdenv/setup"
+
+      mkdir -p "$out"
+
+      ln -s "$input" "$out/identity"
+    '';
+  };
 
 # Encoding generation function which uses zopfli to encode the asset with very high compression efficiency, at the cost of CPU time compressing.
 # Generates gzip, compress/zlib, and deflate outputs all using zopfli with 5 iterations.
