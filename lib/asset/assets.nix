@@ -28,102 +28,59 @@ delay = identifier:
 
 # Default encoding generation function for this platform; usually zopfliEncodings, but gzipEncodings on darwin due to zopfli not building on darwin.
 #
-# defaultEncodings :: String -> Derivation
+# defaultEncodings :: Derivation
 defaultEncodings =
-  identityEncodings;
+  noEncodings;
 
   # Disabling compression to speed up debug builds
   #
   # zopfli isn't supported on macOS as of nixpkgs eafd703a63
   # if nixpkgs.stdenv.isDarwin then gzipEncodings else zopfliEncodings;
 
-# identityEncodings :: String -> Derivation
-identityEncodings = file:
-  nixpkgs.stdenv.mkDerivation {
-    name = "encodings";
-
-    input = mkPath file;
-
-    builder = builtins.toFile "builder.sh" ''
-      source "$stdenv/setup"
-
-      mkdir -p "$out"
-
-      ln -s "$input" "$out/identity"
-    '';
-  };
-
 # Encoding generation function which uses zopfli to encode the asset with very high compression efficiency, at the cost of CPU time compressing.
 # Generates gzip, compress/zlib, and deflate outputs all using zopfli with 5 iterations.
 #
-# zopfliEncodings :: String -> Derivation
-zopfliEncodings = file:
-  nixpkgs.stdenv.mkDerivation {
-    name = "encodings";
+# zopfliEncodings :: Derivation
+zopfliEncodings =
+  let zopfli = "${nixpkgs.zopfli}/bin/zopfli"; in
+  nixpkgs.writeScriptBin "encode" ''
+    #! ${nixpkgs.bash}/bin/bash
+    set -eu
 
-    input = mkPath file;
+    mkdir -p $2
+    cp "$1" "$2/identity"
 
-    builder = builtins.toFile "builder.sh" ''
-      source "$stdenv/setup"
-
-      mkdir -p "$out"
-
-      ln -s "$input" "$out/identity"
-
-      zopfli -c --i5 --gzip "$input" >"$out/gzip"
-      zopfli -c --i5 --zlib "$input" >"$out/compress"
-      zopfli -c --i5 --deflate "$input" >"$out/deflate"
-    '';
-
-    buildInputs = [
-      nixpkgs.zopfli
-    ];
-  };
+    ${zopfli} -c --i5 --gzip "$1" >"$2/gzip"
+    ${zopfli} -c --i5 --zlib "$1" >"$2/compress"
+    ${zopfli} -c --i5 --deflate "$1" >"$2/deflate"
+  '';
 
 # Encoding generation function which uses gzip to encode the asset with decent compression efficiency and a small CPU cost. Only generates a gzip output.
 #
-# gzipEncodings :: String -> Derivation
-gzipEncodings = file:
-  nixpkgs.stdenv.mkDerivation {
-    name = "encodings";
+# gzipEncodings :: Derivation
+gzipEncodings =
+  let gzip = "${nixpkgs.gzip}/bin/gzip"; in
+  nixpkgs.writeScriptBin "encode" ''
+    #! ${nixpkgs.bash}/bin/bash
+    set -eu
 
-    input = mkPath file;
+    mkdir -p $2
+    cp "$1" "$2/identity"
 
-    builder = builtins.toFile "builder.sh" ''
-      source "$stdenv/setup"
-
-      mkdir -p "$out"
-
-      ln -s "$input" "$out/identity"
-
-      gzip -c7 "$input" > "$out/gzip"
-    '';
-
-    buildInputs = [
-      nixpkgs.gzip
-    ];
-  };
+    ${gzip} -c7 "$1" > "$2/gzip"
+  '';
 
 # Encoding generation function which doesn't do any compression.
 #
-# noEncodings :: String -> Derivation
-noEncodings = file:
-  nixpkgs.stdenv.mkDerivation {
-    name = "encodings";
+# noEncodings :: Derivation
+noEncodings =
+  nixpkgs.writeScriptBin "encode" ''
+    #! ${nixpkgs.bash}/bin/bash
+    set -eu
 
-    input = mkPath file;
-
-    builder = builtins.toFile "builder.sh" ''
-      source "$stdenv/setup"
-
-      mkdir -p "$out"
-
-      ln -s "$input" "$out/identity"
-    '';
-
-    buildInputs = [
-    ];
-  };
+    mkdir -p $2
+    cp $1 $2/identity
+  '';
 
 # Convert an attrset into a list of name/value pairs.
 #
@@ -227,18 +184,6 @@ dirToPath = contents:
 # Given a @DirEntry@ either use 'dirToPath' to make a derivation with its contents or return the path directly.
 toPath = x: if x.type == "directory" then dirToPath x.contents else x.path;
 
-# Given a file path, hash its contents as nix does and return the hash string.
-hashFileD = path:
-  nixpkgs.runCommand "hashFile" {
-    buildInputs = [
-      nixpkgs.nix
-    ];
-    preferLocalBuild = true;
-    path = mkPath path;
-  } ''
-    nix-hash --flat --base32 --type sha256 "$path" | tr -d '\n' >"$out"
-  '';
-
 # Build a DirEntry of the shape { type :: String, contents :: {DirEntry} } with type set to directory. Used to create a data model to pass to toPath.
 #
 # dir :: String -> DirEntry
@@ -278,35 +223,39 @@ mkPath = path:
     }
     else path;
 
-# Given an encoding generation function and a file entry resulting from readDirRecursive in the form { name :: String, value: { path :: String } },
-# build a DirEntry for dirToPath with the various encodings of the asset for dirToPath to build into a final directory tree.
-mkAsset = encodings: {name, value}:
-  let hashD = hashFileD value.path;
-      nameWithHash = "${delay "1" (builtins.trace
-        "importing IFD asset hash"
-        (builtins.readFile hashD))}-${name}";
-  in {
-    toDo = hashD;
-    res = delay "2" {
-      ${nameWithHash} = dir {
-        type = symlink (builtins.toFile "type" "immutable");
-        encodings = symlink (encodings value.path);
-      };
-      ${name} = dir {
-        type = symlink (builtins.toFile "type" "redirect");
-        target = symlink (builtins.toFile "target" "${nameWithHash}");
-      };
-    };
-  };
+thingo = encode:
+  nixpkgs.writeScriptBin "mkAsset" ''
+    #! ${nixpkgs.bash}/bin/bash
+    set -eu
+
+    inFile=$1
+    outDir=$2
+    nameWithHash="$(${nixpkgs.nix}/bin/nix-hash --flat --base32 --type sha256 "$inFile" | tr -d '\n')-$(basename "$inFile")"
+
+    immutableDir="$outDir"/"$(dirname "$inFile")"/"$nameWithHash"
+    mkdir -p "$immutableDir"
+    echo -n "immutable" > "$immutableDir"/type
+    ${encode}/bin/encode "$inFile" "$immutableDir"/encodings
+
+    mkdir -p "$outDir"/"$inFile"
+    echo -n "redirect" > "$outDir"/"$inFile"/type
+    echo "$nameWithHash" > "$outDir"/"$inFile"/target
+  '';
 
 # Given an encoding generation function to use and a directory containing assets, recursively walk the directory and encode each asset.
 #
-# mkAssetsWith :: (String -> Derivation) -> String -> Derivation
-mkAssetsWith = encodings: d: let
-  union = unionMapFilesWithName (mkAsset encodings) (readDirRecursive d);
-  in if lazyCheck
-    then union.toDo
-    else builtins.seq (builtins.readFile union.toDo) (dirToPath union.res);
+# mkAssetsWith :: Derivation -> String -> Derivation
+mkAssetsWith = encode: dir:
+  nixpkgs.stdenv.mkDerivation {
+    name = "encodings";
+    src = dir;
+    buildInputs = [ (thingo encode) ];
+    buildPhase = "true";
+    installPhase = ''
+      mkdir -p $out
+      find . -type f -exec mkAsset '{}' "$out" \;
+    '';
+  };
 
 # Given an input directory containing assets, recursively walk the directory and encode each asset with the default encodings.
 #
